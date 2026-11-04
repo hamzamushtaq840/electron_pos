@@ -1,4 +1,4 @@
-# Hamza POS
+# POS
 
 Offline Electron + React + SQLite point of sale for small retail and grocery stores. The application stores all operational data in the Electron `userData` directory and does not require an internet connection after installation.
 
