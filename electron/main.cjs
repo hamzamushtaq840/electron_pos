@@ -15,6 +15,96 @@ const DEFAULT_THEME = {
   secondary: "#FFFFFF",
   background: "#F5F5F5",
 };
+
+let cachedEscpos = null;
+
+function getEscpos() {
+  if (cachedEscpos) return cachedEscpos;
+
+  const escpos = require("escpos");
+  escpos.USB = require("escpos-usb");
+
+  cachedEscpos = escpos;
+  return cachedEscpos;
+}
+
+function runPrinterJob(jobFn, timeoutMs = 10000) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let device;
+    let isOpen = false;
+
+    const escpos = getEscpos();
+
+    const cleanup = () => {
+      clearTimeout(timer);
+
+      if (device) {
+        device.removeListener("error", onError);
+      }
+    };
+
+    const closeDevice = () => {
+      if (isOpen && device) {
+        isOpen = false;
+        try {
+          device.close();
+        } catch (err) {
+          console.error("Printer close error:", err);
+        }
+      }
+    };
+
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve();
+    };
+
+    const fail = (err) => {
+      if (settled) return;
+
+      settled = true;
+      cleanup();
+      closeDevice();
+
+      reject(err instanceof Error ? err : new Error(String(err)));
+    };
+
+    const onError = (err) => fail(err);
+
+    const timer = setTimeout(() => {
+      fail(new Error("Printer timed out."));
+    }, timeoutMs);
+
+    try {
+      device = new escpos.USB();
+      device.once("error", onError);
+
+      device.open((openErr) => {
+        if (openErr) return fail(openErr);
+
+        isOpen = true;
+
+        if (settled) {
+          closeDevice();
+          return;
+        }
+
+        try {
+          const printer = new escpos.Printer(device);
+          jobFn(printer, done, fail);
+        } catch (err) {
+          fail(err);
+        }
+      });
+    } catch (err) {
+      fail(err);
+    }
+  });
+}
+
 function initDb(pin) {
   if (pin !== SETUP_PIN) throw new Error("Incorrect setup PIN.");
   db.exec(`
@@ -633,7 +723,7 @@ function setupIpc() {
     tx();
     return { total };
   });
-  ipcMain.handle("print-receipt", (_, { receiptId }) => {
+  ipcMain.handle("print-receipt", async (_, { receiptId }) => {
     const receipt = one("SELECT * FROM receipts WHERE receipt_id=?", [
       receiptId,
     ]);
@@ -666,12 +756,13 @@ function setupIpc() {
       .filter(Boolean)
       .join("\n");
     try {
-      const escpos = require("escpos");
-      const usb = require("escpos-usb");
-      escpos.USB = usb;
-      const device = new escpos.USB();
-      const printer = new escpos.Printer(device);
-      device.open(() => printer.align("CT").text(lines).cut().close());
+      await runPrinterJob((printer, done, fail) => {
+        printer
+          .align("CT")
+          .text(lines)
+          .cut()
+          .close((err) => (err ? fail(err) : done()));
+      });
       return { ok: true, receiptId };
     } catch (error) {
       return {
@@ -698,25 +789,32 @@ function setupIpc() {
     tx();
     return { ok: true };
   });
-  ipcMain.handle("drawer", () => {
+  ipcMain.handle("drawer", async () => {
     try {
-      const escpos = require("escpos");
-      const usb = require("escpos-usb");
-      escpos.USB = usb;
-      const device = new escpos.USB();
-      const printer = new escpos.Printer(device);
-      device.open(() =>
-        printer.raw(Buffer.from([0x1b, 0x70, 0x00, 0x19, 0xfa])).close(),
-      );
+      await runPrinterJob((printer, done, fail) => {
+        printer
+          .raw(Buffer.from([0x1b, 0x70, 0x00, 0x19, 0xfa]))
+          .close((err) => (err ? fail(err) : done()));
+      });
       return { ok: true };
     } catch (e) {
-      return { ok: false, error: e.message };
+      return { ok: false, error: `Drawer unavailable: ${e.message}` };
     }
   });
   // HID barcode scanners emulate keyboard input and cannot be queried as a
   // separate USB device reliably. The renderer marks the scanner ready only
   // after receiving a barcode sequence ending in Enter.
-  ipcMain.handle("hardware", () => ({ printer: false, scanner: false }));
+  ipcMain.handle("hardware", () => {
+    let printerConnected = false;
+    try {
+      const escpos = getEscpos();
+      const printers = escpos.USB.findPrinter();
+      printerConnected = Array.isArray(printers) && printers.length > 0;
+    } catch {
+      printerConnected = false;
+    }
+    return { printer: printerConnected, scanner: false };
+  });
 }
 function createWindow() {
   const win = new BrowserWindow({
