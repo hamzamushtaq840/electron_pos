@@ -1897,6 +1897,31 @@ function Settings({ theme, setTheme, onProfileSaved }) {
   const [profile, setProfile] = useState({});
   const [activeTab, setActiveTab] = useState("profile");
   const notify = useToast();
+  const [printers, setPrinters] = useState([]);
+  const [printerName, setPrinterName] = useState("");
+  async function loadPrinters() {
+    try {
+      const result = await call("printers-list");
+      setPrinters(result.list);
+      setPrinterName(result.selected || "");
+    } catch (error) {
+      notify(error.message, "error");
+    }
+  }
+  useEffect(() => {
+    if (activeTab === "hardware") loadPrinters();
+  }, [activeTab]);
+  async function choosePrinter(name) {
+    setPrinterName(name);
+    await call("printer-save", name);
+    notify("Printer saved.");
+  }
+  async function testPrint() {
+    const result = await call("printer-test");
+    result.ok
+      ? notify("Test receipt sent to printer.")
+      : notify(result.error, "error");
+  }
   useEffect(() => {
     one("SELECT * FROM store_profile WHERE id=1").then((savedProfile) =>
       setProfile(savedProfile || {}),
@@ -2162,14 +2187,40 @@ function Settings({ theme, setTheme, onProfileSaved }) {
               </div>
               <div className="hardware-setting">
                 <div>
-                  <strong>Printer port</strong>
-                  <span>USB thermal printer via escpos-usb.</span>
+                  <strong>Receipt printer</strong>
+                  <span>Pick the thermal printer installed in Windows.</span>
                 </div>
-                <select className="input">
-                  <option>USB (automatic)</option>
-                  <option>COM1</option>
-                  <option>COM2</option>
-                </select>
+                <div className="image-upload-actions">
+                  <select
+                    className="input"
+                    value={printerName}
+                    onChange={(event) => choosePrinter(event.target.value)}
+                  >
+                    {!printers.length && (
+                      <option value="">No printers found</option>
+                    )}
+                    {printers.map((printer) => (
+                      <option key={printer.name} value={printer.name}>
+                        {printer.name}
+                        {printer.isDefault ? " (default)" : ""}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    className="button tiny"
+                    onClick={loadPrinters}
+                  >
+                    Refresh
+                  </button>
+                  <button
+                    type="button"
+                    className="button tiny"
+                    onClick={testPrint}
+                  >
+                    Test print
+                  </button>
+                </div>
               </div>
               <div className="hardware-setting">
                 <div>
@@ -2177,6 +2228,33 @@ function Settings({ theme, setTheme, onProfileSaved }) {
                   <span>HID keyboard scanner ending with Enter.</span>
                 </div>
                 <StatusBadge tone="gray">Auto detect</StatusBadge>
+              </div>
+              <div className="hardware-setting">
+                <div>
+                  <strong>Printer log</strong>
+                  <span>
+                    Open the folder containing printer-error.log to send to
+                    support.
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  className="button tiny"
+                  onClick={async () => {
+                    try {
+                      const result = await call("open-log-folder");
+                      if (!result?.ok)
+                        notify(
+                          result?.error || "Could not open folder.",
+                          "error",
+                        );
+                    } catch (error) {
+                      notify(error.message, "error");
+                    }
+                  }}
+                >
+                  Open log folder
+                </button>
               </div>
             </div>
           )}

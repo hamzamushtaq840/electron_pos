@@ -1,7 +1,11 @@
-const { app, BrowserWindow, ipcMain, dialog } = require("electron");
+const { app, BrowserWindow, ipcMain, dialog, shell } = require("electron");
 const path = require("path");
 const fs = require("fs");
+const os = require("os");
 const crypto = require("crypto");
+const { execFile } = require("child_process");
+const { promisify } = require("util");
+const execFileP = promisify(execFile);
 const { pathToFileURL } = require("url");
 const { fileURLToPath } = require("url");
 const Database = require("better-sqlite3");
@@ -15,95 +19,160 @@ const DEFAULT_THEME = {
   secondary: "#FFFFFF",
   background: "#F5F5F5",
 };
+const logPath = path.join(userDir, "printer-error.log");
 
-let cachedEscpos = null;
-
-function getEscpos() {
-  if (cachedEscpos) return cachedEscpos;
-
-  const escpos = require("escpos");
-  escpos.USB = require("escpos-usb");
-
-  cachedEscpos = escpos;
-  return cachedEscpos;
+function logError(label, error) {
+  const line = `[${new Date().toISOString()}] ${label}: ${error?.stack || error}\n`;
+  console.error(line);
+  try {
+    fs.appendFileSync(logPath, line);
+  } catch {}
 }
 
-function runPrinterJob(jobFn, timeoutMs = 10000) {
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    let device;
-    let isOpen = false;
+// ---------- Printing via the OS print spooler (raw ESC/POS) ----------
+const printerSettingsPath = path.join(userDir, "printer.json");
+const psScriptPath = path.join(userDir, "raw-print.ps1");
 
-    const escpos = getEscpos();
+const RAW_PRINT_PS = `param([string]$Printer, [string]$DataFile)
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class RawPrint {
+  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Ansi)]
+  public class DOCINFOA {
+    [MarshalAs(UnmanagedType.LPStr)] public string pDocName;
+    [MarshalAs(UnmanagedType.LPStr)] public string pOutputFile;
+    [MarshalAs(UnmanagedType.LPStr)] public string pDataType;
+  }
+  [DllImport("winspool.Drv", EntryPoint="OpenPrinterA", SetLastError=true, CharSet=CharSet.Ansi, ExactSpelling=true)]
+  public static extern bool OpenPrinter(string szPrinter, out IntPtr hPrinter, IntPtr pd);
+  [DllImport("winspool.Drv", EntryPoint="ClosePrinter", SetLastError=true, ExactSpelling=true)]
+  public static extern bool ClosePrinter(IntPtr hPrinter);
+  [DllImport("winspool.Drv", EntryPoint="StartDocPrinterA", SetLastError=true, CharSet=CharSet.Ansi, ExactSpelling=true)]
+  public static extern bool StartDocPrinter(IntPtr hPrinter, int level, [In, MarshalAs(UnmanagedType.LPStruct)] DOCINFOA di);
+  [DllImport("winspool.Drv", EntryPoint="EndDocPrinter", SetLastError=true, ExactSpelling=true)]
+  public static extern bool EndDocPrinter(IntPtr hPrinter);
+  [DllImport("winspool.Drv", EntryPoint="StartPagePrinter", SetLastError=true, ExactSpelling=true)]
+  public static extern bool StartPagePrinter(IntPtr hPrinter);
+  [DllImport("winspool.Drv", EntryPoint="EndPagePrinter", SetLastError=true, ExactSpelling=true)]
+  public static extern bool EndPagePrinter(IntPtr hPrinter);
+  [DllImport("winspool.Drv", EntryPoint="WritePrinter", SetLastError=true, ExactSpelling=true)]
+  public static extern bool WritePrinter(IntPtr hPrinter, IntPtr pBytes, int dwCount, out int dwWritten);
 
-    const cleanup = () => {
-      clearTimeout(timer);
-
-      if (device) {
-        device.removeListener("error", onError);
-      }
-    };
-
-    const closeDevice = () => {
-      if (isOpen && device) {
-        isOpen = false;
-        try {
-          device.close();
-        } catch (err) {
-          console.error("Printer close error:", err);
-        }
-      }
-    };
-
-    const done = () => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      resolve();
-    };
-
-    const fail = (err) => {
-      if (settled) return;
-
-      settled = true;
-      cleanup();
-      closeDevice();
-
-      reject(err instanceof Error ? err : new Error(String(err)));
-    };
-
-    const onError = (err) => fail(err);
-
-    const timer = setTimeout(() => {
-      fail(new Error("Printer timed out."));
-    }, timeoutMs);
-
+  public static void Send(string printer, byte[] bytes) {
+    IntPtr h;
+    if (!OpenPrinter(printer, out h, IntPtr.Zero))
+      throw new Exception("OpenPrinter failed (" + Marshal.GetLastWin32Error() + ") for '" + printer + "'");
+    DOCINFOA di = new DOCINFOA();
+    di.pDocName = "POS Receipt";
+    di.pDataType = "RAW";
     try {
-      device = new escpos.USB();
-      device.once("error", onError);
-
-      device.open((openErr) => {
-        if (openErr) return fail(openErr);
-
-        isOpen = true;
-
-        if (settled) {
-          closeDevice();
-          return;
-        }
-
+      if (!StartDocPrinter(h, 1, di)) throw new Exception("StartDocPrinter failed (" + Marshal.GetLastWin32Error() + ")");
+      try {
+        if (!StartPagePrinter(h)) throw new Exception("StartPagePrinter failed (" + Marshal.GetLastWin32Error() + ")");
+        IntPtr p = Marshal.AllocCoTaskMem(bytes.Length);
         try {
-          const printer = new escpos.Printer(device);
-          jobFn(printer, done, fail);
-        } catch (err) {
-          fail(err);
-        }
-      });
-    } catch (err) {
-      fail(err);
-    }
-  });
+          Marshal.Copy(bytes, 0, p, bytes.Length);
+          int written;
+          if (!WritePrinter(h, p, bytes.Length, out written)) throw new Exception("WritePrinter failed (" + Marshal.GetLastWin32Error() + ")");
+        } finally { Marshal.FreeCoTaskMem(p); }
+        EndPagePrinter(h);
+      } finally { EndDocPrinter(h); }
+    } finally { ClosePrinter(h); }
+  }
 }
+"@
+$bytes = [System.IO.File]::ReadAllBytes($DataFile)
+[RawPrint]::Send($Printer, $bytes)
+`;
+
+function getSavedPrinter() {
+  try {
+    return (
+      JSON.parse(fs.readFileSync(printerSettingsPath, "utf8")).name || null
+    );
+  } catch {
+    return null;
+  }
+}
+
+async function listPrinters() {
+  const win = BrowserWindow.getAllWindows()[0];
+  if (!win) return [];
+  const list = await win.webContents.getPrintersAsync();
+  return list.map((p) => ({ name: p.name, isDefault: !!p.isDefault }));
+}
+
+async function resolvePrinterName() {
+  const list = await listPrinters();
+  const saved = getSavedPrinter();
+  if (saved && list.some((p) => p.name === saved)) return saved;
+  const guess = list.find((p) =>
+    /pos|receipt|thermal|xprinter|ocpp|rongta|epson|tm-/i.test(p.name),
+  );
+  return guess?.name || list.find((p) => p.isDefault)?.name || null;
+}
+
+async function sendRaw(buffer) {
+  const name = await resolvePrinterName();
+  if (!name)
+    throw new Error("No printer found. Choose one in Settings > Hardware.");
+  const tmp = path.join(os.tmpdir(), `pos-job-${Date.now()}.bin`);
+  fs.writeFileSync(tmp, buffer);
+  try {
+    if (process.platform === "win32") {
+      fs.writeFileSync(psScriptPath, RAW_PRINT_PS);
+      await execFileP(
+        "powershell.exe",
+        [
+          "-NoProfile",
+          "-NonInteractive",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          psScriptPath,
+          "-Printer",
+          name,
+          "-DataFile",
+          tmp,
+        ],
+        { windowsHide: true, timeout: 20000 },
+      );
+    } else {
+      // macOS / Linux (development): CUPS raw queue
+      await execFileP("lp", ["-d", name, "-o", "raw", tmp], { timeout: 20000 });
+    }
+  } catch (error) {
+    throw new Error(
+      String(error.stderr || error.message || error)
+        .trim()
+        .split("\n")[0],
+    );
+  } finally {
+    fs.unlink(tmp, () => {});
+  }
+}
+
+const toAscii = (text) => String(text).replace(/[^\x20-\x7E\n]/g, "?");
+const receiptBytes = (text) =>
+  Buffer.concat([
+    Buffer.from([0x1b, 0x40]), // initialize
+    Buffer.from([0x1b, 0x61, 0x01]), // center
+    Buffer.from(toAscii(text) + "\n\n\n\n", "ascii"),
+    Buffer.from([0x1d, 0x56, 0x42, 0x00]), // feed and cut
+  ]);
+const DRAWER_KICK = Buffer.from([0x1b, 0x70, 0x00, 0x19, 0xfa]);
+
+ipcMain.handle("open-log-folder", async () => {
+  // If the log exists, open the folder with the file selected.
+  if (fs.existsSync(logPath)) {
+    shell.showItemInFolder(logPath);
+    return { ok: true };
+  }
+  // Otherwise just open the data folder.
+  const error = await shell.openPath(userDir);
+  return error ? { ok: false, error } : { ok: true };
+});
 
 function initDb(pin) {
   if (pin !== SETUP_PIN) throw new Error("Incorrect setup PIN.");
@@ -143,6 +212,7 @@ function initDb(pin) {
     "INSERT OR REPLACE INTO app_meta(key,value) VALUES('admin_pin',?)",
   ).run(pin);
 }
+
 function seedDemoData() {
   const count = one("SELECT COUNT(*) AS count FROM products");
   if (count && count.count > 0) return;
@@ -756,15 +826,10 @@ function setupIpc() {
       .filter(Boolean)
       .join("\n");
     try {
-      await runPrinterJob((printer, done, fail) => {
-        printer
-          .align("CT")
-          .text(lines)
-          .cut()
-          .close((err) => (err ? fail(err) : done()));
-      });
+      await sendRaw(receiptBytes(lines));
       return { ok: true, receiptId };
     } catch (error) {
+      logError("print-receipt failed", error);
       return {
         ok: false,
         receiptId,
@@ -791,29 +856,52 @@ function setupIpc() {
   });
   ipcMain.handle("drawer", async () => {
     try {
-      await runPrinterJob((printer, done, fail) => {
-        printer
-          .raw(Buffer.from([0x1b, 0x70, 0x00, 0x19, 0xfa]))
-          .close((err) => (err ? fail(err) : done()));
-      });
+      await sendRaw(DRAWER_KICK);
       return { ok: true };
     } catch (e) {
+      logError("drawer failed", e);
       return { ok: false, error: `Drawer unavailable: ${e.message}` };
     }
   });
   // HID barcode scanners emulate keyboard input and cannot be queried as a
   // separate USB device reliably. The renderer marks the scanner ready only
   // after receiving a barcode sequence ending in Enter.
-  ipcMain.handle("hardware", () => {
-    let printerConnected = false;
+  ipcMain.handle("hardware", async () => {
+    let connected = false;
     try {
-      const escpos = getEscpos();
-      const printers = escpos.USB.findPrinter();
-      printerConnected = Array.isArray(printers) && printers.length > 0;
-    } catch {
-      printerConnected = false;
+      const list = await listPrinters();
+      const saved = getSavedPrinter();
+      connected =
+        list.some((p) => p.name === saved) ||
+        list.some((p) =>
+          /pos|receipt|thermal|xprinter|ocpp|rongta|epson|tm-/i.test(p.name),
+        );
+    } catch {}
+    return { printer: connected, scanner: false };
+  });
+
+  ipcMain.handle("printers-list", async () => {
+    const list = await listPrinters();
+    return { list, selected: await resolvePrinterName() };
+  });
+
+  ipcMain.handle("printer-save", (_, name) => {
+    fs.writeFileSync(printerSettingsPath, JSON.stringify({ name }));
+    return { ok: true };
+  });
+
+  ipcMain.handle("printer-test", async () => {
+    try {
+      await sendRaw(
+        receiptBytes(
+          "TEST PRINT\n--------------------------------\nHamza POS printer works.\n--------------------------------",
+        ),
+      );
+      return { ok: true };
+    } catch (error) {
+      logError("printer-test failed", error);
+      return { ok: false, error: `Printer unavailable: ${error.message}` };
     }
-    return { printer: printerConnected, scanner: false };
   });
 }
 function createWindow() {
